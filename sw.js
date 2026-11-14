@@ -1,6 +1,6 @@
 // Service Worker لمحرك walow game
 // الشبكة أولاً (تصلك التعديلات الجديدة دائماً) ثم النسخة المحفوظة عند انقطاع الإنترنت
-const CACHE = 'walow-game-v3';
+const CACHE = 'walow-game-v4';
 const FILES = ['./', './index.html', './manifest.json', './engine.js', './ai-bridge.js', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
