@@ -8,7 +8,7 @@ const history = [];
 const recentErrors = [];
 const LS = {
   key: 'walow_gemini_key',
-  model: 'walow_gemini_model',
+  model: 'walow_gemini_model_manual', // يدوي فقط (القيمة التلقائية القديمة تُتجاهل)
   project: 'walow_project_v1',
 };
 const API = 'https://generativelanguage.googleapis.com/v1beta';
@@ -77,24 +77,25 @@ function openSettings() {
   };
 }
 
-// اختيار أحدث نموذج flash متاح لمفتاحك تلقائياً
-async function getModel(key) {
-  let m = '';
-  try { m = localStorage.getItem(LS.model) || ''; } catch (_) {}
-  if (m) return m;
+// قائمة نماذج flash المتاحة لمفتاحك، الأحدث أولاً (تُجلب مرة لكل جلسة)
+let modelPool = null;
+async function getModelPool(key) {
+  if (modelPool) return modelPool;
   const r = await fetch(`${API}/models?pageSize=200`, { headers: { 'x-goog-api-key': key } });
   if (!r.ok) throw new Error(await explainHttp(r));
-  const list = ((await r.json()).models || []).filter((x) => (x.supportedGenerationMethods || []).includes('generateContent'));
+  const names = ((await r.json()).models || [])
+    .filter((x) => (x.supportedGenerationMethods || []).includes('generateContent'))
+    .map((x) => x.name.replace('models/', ''));
   const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [0, 0])[1]);
-  const bad = /lite|image|tts|audio|live|robotics|computer|embed|thinking|learnlm|gemma/i;
-  const stable = list.map((x) => x.name.replace('models/', '')).filter((n) => /^gemini-[\d.]+-flash(-\d+)?$/.test(n));
-  const loose = list.map((x) => x.name.replace('models/', '')).filter((n) => /flash/.test(n) && !bad.test(n));
-  const pool = stable.length ? stable : loose;
+  const bad = /image|tts|audio|live|robotics|computer|embed|thinking|learnlm|gemma/i;
+  const byVer = (arr) => arr.sort((x, y) => ver(y) - ver(x));
+  const stable = byVer(names.filter((n) => /^gemini-[\d.]+-flash(-\d+)?$/.test(n)));
+  const other = byVer(names.filter((n) => /flash/.test(n) && !bad.test(n) && !/lite/.test(n) && !stable.includes(n)));
+  const lite = byVer(names.filter((n) => /flash-lite/.test(n) && !bad.test(n)));
+  const pool = [...new Set([...stable, ...other, ...lite])];
   if (!pool.length) throw new Error('لم أجد نموذجاً مناسباً لمفتاحك. اكتب اسم النموذج يدوياً من الإعدادات.');
-  pool.sort((a, b) => ver(b) - ver(a));
-  m = pool[0];
-  try { localStorage.setItem(LS.model, m); } catch (_) {}
-  return m;
+  modelPool = pool;
+  return pool;
 }
 
 async function explainHttp(r) {
@@ -106,29 +107,54 @@ async function explainHttp(r) {
   return `خطأ من Gemini (${r.status}). ${t}`;
 }
 
-async function callGemini(parts) {
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// يحاول عند ضغط الخوادم (5xx)، ويجرب نموذجاً بديلاً عند انتهاء الحصة (429) أو غياب النموذج (404)
+async function callGemini(parts, onStatus) {
   const key = getApiKey();
-  const body = (model) => JSON.stringify({
+  let manual = '';
+  try { manual = localStorage.getItem(LS.model) || ''; } catch (_) {}
+  const models = manual ? [manual] : (await getModelPool(key)).slice(0, 3);
+  const payload = JSON.stringify({
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents: [...history.slice(-10), { role: 'user', parts }],
     generationConfig: { temperature: 0.6, maxOutputTokens: 8192 },
   });
-  let model = await getModel(key);
-  let r = await fetch(`${API}/models/${model}:generateContent`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: body(model),
-  });
-  if (r.status === 404 && !localStorage.getItem('walow_model_manual')) {
-    try { localStorage.removeItem(LS.model); } catch (_) {}
-    model = await getModel(key);
-    r = await fetch(`${API}/models/${model}:generateContent`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: body(model),
-    });
+  let lastErr;
+  for (let mi = 0; mi < models.length; mi++) {
+    const model = models[mi];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let r;
+      try {
+        r = await fetch(`${API}/models/${model}:generateContent`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: payload,
+        });
+      } catch (e) {
+        lastErr = new Error('تعذر الاتصال بالإنترنت. تأكد من الشبكة.');
+        await sleep(1500);
+        continue;
+      }
+      if (r.ok) {
+        const j = await r.json();
+        const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
+        if (!text) throw new Error('لم يرجع النموذج جواباً' + (j.promptFeedback?.blockReason ? ` (${j.promptFeedback.blockReason})` : '') + '.');
+        return text;
+      }
+      lastErr = new Error(await explainHttp(r));
+      if ([500, 502, 503, 504].includes(r.status)) {
+        if (attempt < 2) {
+          if (onStatus) onStatus(`Gemini مشغول حالياً، أعيد المحاولة… (${attempt + 2}/3)`);
+          await sleep(1500 * (attempt + 1));
+          continue;
+        }
+        break;
+      }
+      if (r.status === 429 || r.status === 404) break;
+      throw lastErr; // مفتاح خاطئ أو طلب مرفوض: لا فائدة من التكرار
+    }
+    if (mi < models.length - 1 && onStatus) onStatus('أجرّب نموذجاً بديلاً…');
   }
-  if (!r.ok) throw new Error(await explainHttp(r));
-  const j = await r.json();
-  const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('');
-  if (!text) throw new Error('لم يرجع النموذج جواباً' + (j.promptFeedback?.blockReason ? ` (${j.promptFeedback.blockReason})` : '') + '.');
-  return text;
+  throw lastErr || new Error('فشل الاتصال بـ Gemini.');
 }
 
 // ---------- المشروع (الأكواد المنفذة تُحفظ وتُعاد عند فتح التطبيق) ----------
@@ -241,7 +267,7 @@ async function handleUserSubmit() {
   clearImage();
   const wait = appendMessage('…', 'ai');
   try {
-    const reply = await callGemini(parts);
+    const reply = await callGemini(parts, (t) => { if (wait) wait.innerText = t; });
     history.push({ role: 'user', parts: [{ text: text || '(صورة)' }] }, { role: 'model', parts: [{ text: reply }] });
     wait.remove();
     const { code, prose } = extractCode(reply);
